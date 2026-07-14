@@ -122,7 +122,6 @@ func (p *connPool) Get(ctx context.Context) (*wrapConn, bool, error) {
 			return wc, false, nil
 		}
 		log.DefaultLogger.Warnf("[runtime][rpc] connpool free conn is closed, creating new")
-	}
 	} else {
 		p.mu.Unlock()
 	}

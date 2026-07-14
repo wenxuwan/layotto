@@ -252,7 +252,8 @@ func (m *xChannel) Invoke(req *rpc.RPCRequest) (*rpc.RPCResponse, error) {
 		xstate.mu.Lock()
 		xstate.calls[id] = callChan
 		xstate.mu.Unlock()
-		log.DefaultLogger.Infof("[runtime][rpc] request registered, reqId=%d, traceId=%v, pending=%v", id, traceID, getPendingIDs(xstate))
+		pendingIDs := getPendingIDs(xstate)
+		log.DefaultLogger.Infof("[runtime][rpc] request registered, reqId=%d, traceId=%v, pending=%v", id, traceID, pendingIDs)
 	}
 
 	// write packet
@@ -273,8 +274,6 @@ func (m *xChannel) Invoke(req *rpc.RPCRequest) (*rpc.RPCResponse, error) {
 	}
 
 	// read response and decode it
-	traceID := req.Header["rpc_trace_context.sofatraceid"]
-	rpcID := req.Header["rpc_trace_context.sofarpcid"]
 	select {
 	case res := <-callChan:
 		log.DefaultLogger.Infof("[runtime][rpc] response received, reqId=%d, traceId=%v, rpcId=%v", id, traceID, rpcID)
@@ -283,7 +282,8 @@ func (m *xChannel) Invoke(req *rpc.RPCRequest) (*rpc.RPCResponse, error) {
 		}
 		return m.proto.FromFrame(res.resp)
 	case <-ctx.Done():
-		log.DefaultLogger.Warnf("[runtime][rpc] request timeout, reqId=%d, traceId=%v, rpcId=%v, pending=%v", id, traceID, rpcID, getPendingIDs(xstate))
+		pendingIDs := getPendingIDs(xstate)
+		log.DefaultLogger.Warnf("[runtime][rpc] request timeout, reqId=%d, traceId=%v, rpcId=%v, pending=%v", id, traceID, rpcID, pendingIDs)
 		m.removeCall(xstate, id)
 		return nil, common.Error(common.TimeoutCode, ErrTimeout.Error())
 	}
@@ -340,7 +340,8 @@ func (m *xChannel) onData(conn *wrapConn) error {
 		if ok {
 			notifyChan <- call{resp: frame}
 		} else {
-			log.DefaultLogger.Warnf("[runtime][rpc] response unmatched! reqId=%d, pending=%v", reqID32, getPendingIDs(xstate))
+			pendingIDs := getPendingIDs(xstate)
+			log.DefaultLogger.Warnf("[runtime][rpc] response unmatched! reqId=%d, pending=%v", reqID32, pendingIDs)
 		}
 	}
 	return nil
