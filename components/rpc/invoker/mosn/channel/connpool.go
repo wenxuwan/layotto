@@ -118,16 +118,21 @@ func (p *connPool) Get(ctx context.Context) (*wrapConn, bool, error) {
 		p.mu.Unlock()
 		wc := ele.Value.(*wrapConn)
 		if !wc.isClose() {
+			log.DefaultLogger.Debugf("[runtime][rpc] connpool reuse free conn")
 			return wc, false, nil
 		}
+		log.DefaultLogger.Warnf("[runtime][rpc] connpool free conn is closed, creating new")
+	}
 	} else {
 		p.mu.Unlock()
 	}
 
 	// create new conn
+	log.DefaultLogger.Infof("[runtime][rpc] connpool creating new conn")
 	c, err := p.dialFunc()
 	if err != nil {
 		p.freeTurn()
+		log.DefaultLogger.Errorf("[runtime][rpc] connpool dial failed: %v", err)
 		return nil, false, err
 	}
 	cancelCtx, cancel := context.WithCancel(context.Background())
@@ -136,6 +141,7 @@ func (p *connPool) Get(ctx context.Context) (*wrapConn, bool, error) {
 		wc.state = p.stateFunc()
 	}
 	// start a readloop gorountine to read and handle data
+	log.DefaultLogger.Infof("[runtime][rpc] connpool new conn created, starting readloop")
 	if p.onDataFunc != nil {
 		utils.GoWithRecover(func() {
 			p.readloop(wc)
@@ -165,9 +171,11 @@ func (p *connPool) Put(c *wrapConn, close bool) {
 
 // readloop is loop to read connected then exec onDataFunc
 func (p *connPool) readloop(c *wrapConn) {
+	log.DefaultLogger.Infof("[runtime][rpc] readloop started")
 	var err error
 
 	defer func() {
+		log.DefaultLogger.Warnf("[runtime][rpc] readloop exited, err=%v", err)
 		c.close()
 		if p.cleanupFunc != nil {
 			p.cleanupFunc(c, err)
@@ -188,6 +196,7 @@ func (p *connPool) readloop(c *wrapConn) {
 		}
 
 		if n > 0 {
+			log.DefaultLogger.Debugf("[runtime][rpc] connpool readloop read %d bytes", n)
 			// handle data.
 			// it will delegate to hstate if it's constructed by httpchannel
 			if onDataErr := p.onDataFunc(c); onDataErr != nil {

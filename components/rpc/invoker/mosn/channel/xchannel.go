@@ -122,6 +122,9 @@ func (m *xChannel) InvokeWithTargetAddress(req *rpc.RPCRequest) (*rpc.RPCRespons
 
 	// 3. encode request
 	frame := m.proto.ToFrame(req)
+	directTraceID := req.Header["rpc_trace_context.sofatraceid"]
+	directRpcID := req.Header["rpc_trace_context.sofarpcid"]
+	log.DefaultLogger.Infof("[runtime][rpc] direct send request, target=%s, traceId=%v, rpcId=%v, oneway=%v", req.Header[rpc.TargetAddress], directTraceID, directRpcID, frame.GetStreamType() == api.RequestOneWay)
 	buf, encErr := m.proto.Encode(req.Ctx, frame)
 	if encErr != nil {
 		return nil, common.Error(common.InternalCode, encErr.Error())
@@ -160,11 +163,14 @@ func (m *xChannel) InvokeWithTargetAddress(req *rpc.RPCRequest) (*rpc.RPCRespons
 }
 
 func (m *xChannel) readResponse(wc *wrapConn, callChan chan<- call) {
+	log.DefaultLogger.Infof("[runtime][rpc] readResponse started")
 	var err error
 	defer func() {
 		if err != nil {
+			log.DefaultLogger.Errorf("[runtime][rpc] readResponse error: %v", err)
 			callChan <- call{err: err}
 		}
+		log.DefaultLogger.Infof("[runtime][rpc] readResponse ended")
 		wc.Close()
 	}()
 
@@ -190,6 +196,7 @@ func (m *xChannel) readResponse(wc *wrapConn, callChan chan<- call) {
 			}
 			frame, ok := iframe.(api.XRespFrame)
 			if frame == nil {
+				log.DefaultLogger.Debugf("[runtime][rpc]direct conn frame is nil, continue reading")
 				continue
 			}
 			if !ok {
@@ -197,6 +204,7 @@ func (m *xChannel) readResponse(wc *wrapConn, callChan chan<- call) {
 				log.DefaultLogger.Errorf("[runtime][rpc]direct conn decode frame err: %s", err)
 				break
 			}
+			log.DefaultLogger.Infof("[runtime][rpc] direct response received, reqId=%d, type=%s", frame.GetRequestId(), frame.GetStreamType())
 			callChan <- call{resp: frame}
 			return
 
@@ -229,6 +237,9 @@ func (m *xChannel) Invoke(req *rpc.RPCRequest) (*rpc.RPCResponse, error) {
 	frame := m.proto.ToFrame(req)
 	id := atomic.AddUint32(&xstate.reqid, 1)
 	frame.SetRequestId(uint64(id))
+	traceID := req.Header["rpc_trace_context.sofatraceid"]
+	rpcID := req.Header["rpc_trace_context.sofarpcid"]
+	log.DefaultLogger.Infof("[runtime][rpc] send request, reqId=%d, traceId=%v, rpcId=%v, target=%v, oneway=%v", id, traceID, rpcID, req.Header[rpc.TargetAddress], frame.GetStreamType() == api.RequestOneWay)
 	buf, encErr := m.proto.Encode(req.Ctx, frame)
 	if encErr != nil {
 		m.pool.Put(conn, false)
@@ -241,10 +252,12 @@ func (m *xChannel) Invoke(req *rpc.RPCRequest) (*rpc.RPCResponse, error) {
 		xstate.mu.Lock()
 		xstate.calls[id] = callChan
 		xstate.mu.Unlock()
+		log.DefaultLogger.Infof("[runtime][rpc] request registered, reqId=%d, traceId=%v, pending=%v", id, traceID, getPendingIDs(xstate))
 	}
 
 	// write packet
 	if _, err := conn.Write(buf.Bytes()); err != nil {
+		log.DefaultLogger.Errorf("[runtime][rpc] write failed, reqId=%d, traceId=%v, err=%v", id, traceID, err)
 		m.removeCall(xstate, id)
 		m.pool.Put(conn, true)
 		return nil, common.Error(common.UnavailebleCode, err.Error())
@@ -260,13 +273,17 @@ func (m *xChannel) Invoke(req *rpc.RPCRequest) (*rpc.RPCResponse, error) {
 	}
 
 	// read response and decode it
+	traceID := req.Header["rpc_trace_context.sofatraceid"]
+	rpcID := req.Header["rpc_trace_context.sofarpcid"]
 	select {
 	case res := <-callChan:
+		log.DefaultLogger.Infof("[runtime][rpc] response received, reqId=%d, traceId=%v, rpcId=%v", id, traceID, rpcID)
 		if res.err != nil {
 			return nil, common.Error(common.UnavailebleCode, res.err.Error())
 		}
 		return m.proto.FromFrame(res.resp)
 	case <-ctx.Done():
+		log.DefaultLogger.Warnf("[runtime][rpc] request timeout, reqId=%d, traceId=%v, rpcId=%v, pending=%v", id, traceID, rpcID, getPendingIDs(xstate))
 		m.removeCall(xstate, id)
 		return nil, common.Error(common.TimeoutCode, ErrTimeout.Error())
 	}
@@ -283,8 +300,12 @@ func (m *xChannel) Do(req *rpc.RPCRequest) (*rpc.RPCResponse, error) {
 // removeCall is delete xstate.calls by id
 func (m *xChannel) removeCall(xstate *xstate, id uint32) {
 	xstate.mu.Lock()
+	_, existed := xstate.calls[id]
 	delete(xstate.calls, id)
 	xstate.mu.Unlock()
+	if existed {
+		log.DefaultLogger.Infof("[runtime][rpc] request removed, reqId=%d", id)
+	}
 }
 
 // onData is handle xstate data
@@ -294,6 +315,7 @@ func (m *xChannel) onData(conn *wrapConn) error {
 		var iframe interface{}
 		iframe, err := m.proto.Decode(context.TODO(), conn.buf)
 		if err != nil {
+			log.DefaultLogger.Errorf("[runtime][rpc] onData decode error: %v", err)
 			return err
 		}
 
@@ -303,6 +325,7 @@ func (m *xChannel) onData(conn *wrapConn) error {
 
 		frame, ok := iframe.(api.XRespFrame)
 		if !ok {
+			log.DefaultLogger.Errorf("[runtime][rpc] onData type assert failed, iframe type=%T", iframe)
 			return errors.New("[runtime][rpc]xchannel type not XRespFrame")
 		}
 
@@ -316,6 +339,8 @@ func (m *xChannel) onData(conn *wrapConn) error {
 		xstate.mu.Unlock()
 		if ok {
 			notifyChan <- call{resp: frame}
+		} else {
+			log.DefaultLogger.Warnf("[runtime][rpc] response unmatched! reqId=%d, pending=%v", reqID32, getPendingIDs(xstate))
 		}
 	}
 	return nil
@@ -326,14 +351,30 @@ func (m *xChannel) cleanup(c *wrapConn, err error) {
 	xstate := c.state.(*xstate)
 	// cleanup pending calls
 	xstate.mu.Lock()
+	pending := make([]uint32, 0, len(xstate.calls))
 	for id, notifyChan := range xstate.calls {
+		pending = append(pending, id)
 		notifyChan <- call{err: err}
 		delete(xstate.calls, id)
 	}
 	xstate.mu.Unlock()
+	log.DefaultLogger.Warnf("[runtime][rpc] cleanup connection, pending calls: %v, err: %v", pending, err)
+}
+
+// getPendingIDs returns list of pending request IDs for debug
+func getPendingIDs(xstate *xstate) []uint32 {
+	xstate.mu.Lock()
+	defer xstate.mu.Unlock()
+	ids := make([]uint32, 0, len(xstate.calls))
+	for id := range xstate.calls {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func (m *xChannel) sendHeartbeat(c *wrapConn) {
+	log.DefaultLogger.Infof("[runtime][rpc] heartbeat goroutine started")
+	defer log.DefaultLogger.Infof("[runtime][rpc] heartbeat goroutine exited")
 	xstate := c.state.(*xstate)
 	request := &bolt.Request{
 		RequestHeader: bolt.RequestHeader{
